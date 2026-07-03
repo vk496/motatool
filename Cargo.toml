@@ -1,0 +1,28 @@
+[package]
+name = "motatool"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Build, verify, inspect, and serve MeshCore .mota firmware-update containers."
+license = "GPL-3.0-or-later"
+repository = "https://github.com/vk496/motatool"
+
+[[bin]]
+name = "motatool"
+path = "src/main.rs"
+
+[lib]
+name = "motatool"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+sha2 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+ihex = "3"
+hex = "0.4"
+ureq = "2"
+
+[dev-dependencies]

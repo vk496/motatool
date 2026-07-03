@@ -1,0 +1,18 @@
+//! motatool — build, verify, inspect, and serve MeshCore `.mota` firmware-update containers.
+//!
+//! The `.mota` on-wire format, merkle tree, EndF trailer, and hash truncation are kept **byte-identical**
+//! to the MeshCore firmware (see `format`, `merkle`, `endf`, `crypto`); the byte layout is pinned by tests
+//! and cross-checked against real containers. Everything else is idiomatic Rust over well-known crates.
+
+pub mod build;
+pub mod crypto;
+pub mod endf;
+pub mod format;
+pub mod input;
+pub mod merkle;
+pub mod targets;
+pub mod verify;
+
+pub use build::{build, BuildOpts, Built};
+pub use format::{Codec, FwIdent, Manifest};
+pub use verify::verify;
