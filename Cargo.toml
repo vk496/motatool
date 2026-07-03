@@ -24,5 +24,9 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 ihex = "3"
 hex = "0.4"
 ureq = "2"
+serialport = { version = "4", default-features = false } # no libudev: we open by path, not enumerate
+walkdir = "2"
+ctrlc = "3"
 
 [dev-dependencies]
+tempfile = "3"

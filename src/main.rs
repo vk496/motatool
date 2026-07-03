@@ -5,9 +5,13 @@ use clap::{Args, Parser, Subcommand};
 use motatool::crypto::{ed25519_keygen, load_key32};
 use motatool::endf::{pack_version, target_id_for_env, version_str};
 use motatool::input::read_input;
+use motatool::serve::{open_serial, open_tcp, serve_loop, Folder, SeederCore};
 use motatool::{build, targets, verify, BuildOpts, Codec, Manifest};
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(
@@ -33,6 +37,8 @@ enum Command {
     Inspect(InspectArgs),
     /// Generate an Ed25519 signing keypair.
     Keygen(KeygenArgs),
+    /// Serve a folder of .mota to a node over USB serial or WiFi, and capture pull-to-folder downloads.
+    Serve(ServeArgs),
 }
 
 #[derive(Args)]
@@ -95,6 +101,34 @@ struct KeygenArgs {
     out: Option<String>,
 }
 
+#[derive(Args)]
+struct ServeArgs {
+    /// Folder of .mota to serve (also the capture destination for pull-to-folder).
+    #[arg(long)]
+    dir: String,
+    /// The node's USB serial port (e.g. /dev/ttyUSB0).
+    #[arg(long, required_unless_present = "tcp", conflicts_with = "tcp")]
+    serial: Option<String>,
+    /// The node's WiFi seeder address host[:port] (default port 5001).
+    #[arg(long)]
+    tcp: Option<String>,
+    /// Serial speed (--serial only).
+    #[arg(long, default_value_t = 115200)]
+    baud: u32,
+    /// Serve only the top folder; don't descend into sub-folders.
+    #[arg(long = "no-recursive")]
+    no_recursive: bool,
+    /// (serial only) don't auto-send `ota folder on`/`off` on the node's console.
+    #[arg(long = "no-enable")]
+    no_enable: bool,
+    /// Warm-start: stage this similar build's payload into each captured .part (for `ota pull … validate`).
+    #[arg(long)]
+    seed: Option<String>,
+    /// Log each request the node makes.
+    #[arg(short, long)]
+    verbose: bool,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
@@ -102,6 +136,7 @@ fn main() -> ExitCode {
         Command::Verify(a) => return cmd_verify(a),
         Command::Inspect(a) => cmd_inspect(a),
         Command::Keygen(a) => cmd_keygen(a),
+        Command::Serve(a) => cmd_serve(a),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -336,6 +371,97 @@ fn cmd_keygen(a: KeygenArgs) -> Result<()> {
         println!("public  -> {out}.pub");
     }
     println!("pubkey: {pub_hex}");
+    Ok(())
+}
+
+fn cmd_serve(a: ServeArgs) -> Result<()> {
+    let dir = PathBuf::from(&a.dir);
+    let folder = Folder::scan(&dir, !a.no_recursive, |p, why| {
+        eprintln!("  ! skip {} : {why}", p.display());
+    });
+    println!(
+        "motatool serve: {} valid .mota in {}{}",
+        folder.count(),
+        a.dir,
+        if a.no_recursive { "" } else { " (recursive)" }
+    );
+    for s in folder.all() {
+        let m = &s.manifest;
+        println!(
+            "  - {} : mid={} target={:08X} [{}] v{} {} {} blocks={} size={}",
+            s.path.file_name().unwrap_or_default().to_string_lossy(),
+            hex::encode_upper(m.merkle_root),
+            m.target_id,
+            targets::label(m.target_id),
+            version_str(m.fw_version),
+            m.codec().map(Codec::name_tag).unwrap_or("?"),
+            if m.is_signed() { "signed" } else { "unsigned" },
+            m.block_count,
+            s.bytes.len()
+        );
+    }
+    if folder.count() == 0 {
+        eprintln!("  (nothing valid to serve)");
+    }
+
+    // The same folder doubles as the pull-to-folder capture store.
+    let mut core = SeederCore::new(folder, Some(dir));
+    if let Some(seed_path) = &a.seed {
+        let bytes =
+            std::fs::read(seed_path).with_context(|| format!("cannot read seed {seed_path}"))?;
+        let m = Manifest::parse(&bytes).context("bad seed .mota")?;
+        let payload = bytes[m.payload_off()..m.payload_off() + m.payload_size as usize].to_vec();
+        println!(
+            "seed: {} mid={} blocks={} payload={} (staged into each capture for `ota pull … validate`)",
+            Path::new(seed_path).file_name().unwrap_or_default().to_string_lossy(),
+            hex::encode_upper(m.merkle_root),
+            m.block_count,
+            m.payload_size
+        );
+        core.set_seed(payload, m.block_count);
+    }
+
+    // Pick the transport: WiFi seeder port (host[:port], default 5001) or a serial port.
+    let use_tcp = a.tcp.is_some();
+    let (mut link, target) = if let Some(hp) = &a.tcp {
+        let (host, port) = match hp.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.parse().context("bad --tcp port")?),
+            None => (hp.clone(), 5001u16),
+        };
+        (open_tcp(&host, port)?, format!("{host}:{port}"))
+    } else {
+        let dev = a.serial.as_ref().expect("required_unless_present tcp");
+        (open_serial(dev, a.baud)?, format!("{dev} @ {}", a.baud))
+    };
+
+    let stop = Arc::new(AtomicBool::new(false));
+    ctrlc::set_handler({
+        let stop = stop.clone();
+        move || stop.store(true, std::sync::atomic::Ordering::Relaxed)
+    })
+    .context("installing Ctrl-C handler")?;
+
+    // The serial console shares the wire, so auto-toggle `ota folder on/off`; the TCP seeder port
+    // auto-enables relaying on connect, so there's nothing to send.
+    let enable = !use_tcp && !a.no_enable;
+    if enable {
+        let _ = link.write_all(b"ota folder on\r\n");
+        println!("sent `ota folder on`");
+    }
+    println!("serving on {target} — Ctrl-C to stop");
+
+    serve_loop(
+        &mut *link,
+        &core,
+        a.verbose,
+        |l| println!("  [dev] {l}"),
+        &stop,
+    );
+
+    if enable {
+        let _ = link.write_all(b"ota folder off\r\n");
+    }
+    println!("\nbye");
     Ok(())
 }
 

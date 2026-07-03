@@ -10,6 +10,7 @@ pub mod endf;
 pub mod format;
 pub mod input;
 pub mod merkle;
+pub mod serve;
 pub mod targets;
 pub mod verify;
 

@@ -58,6 +58,41 @@ pub const NRF52_INPLACE_SEGMENT: u32 = 4096;
 pub const NRF52_FLASH_SPAN: u32 = 0x000D_4000 - 0x0002_6000; // 0xAE000
 pub const NRF52_MAX_INPLACE_MOTA: u32 = NRF52_FLASH_SPAN - NRF52_INPLACE_MEMORY; // ~90 KB
 
+/// The mota-seeder link protocol (host ⇄ node), mirroring `src/helpers/ota/MotaSeederProto.h`.
+///
+/// Request  (host→node): `M S  op(1)  args…               xsum(1 = XOR of op‖args)`
+/// Response (node→host): `m s  op(1)  status(1)  payload…  xsum(1 = XOR of all prior)`
+pub mod seeder {
+    pub const REQ_MAGIC: [u8; 2] = [b'M', b'S'];
+    pub const RSP_MAGIC: [u8; 2] = [b'm', b's'];
+    pub const OP_COUNT: u8 = 0x01; // → count(1)
+    pub const OP_DESCRIBE: u8 = 0x02; // idx(1) → MotaDesc(38)
+    pub const OP_READ: u8 = 0x03; // idx(1) off(4) len(2) → bytes
+    pub const OP_STAT: u8 = 0x04; // mid(4) → present(1) total(4)
+    pub const OP_BEGIN: u8 = 0x05; // mid(4) total(4) → OK (create 0xFF-filled)
+    pub const OP_WRITE: u8 = 0x06; // mid(4) off(4) len(2) data(len) → OK
+    pub const OP_SREAD: u8 = 0x07; // mid(4) off(4) len(2) → bytes (0xFF = unwritten)
+    pub const OP_FIN: u8 = 0x08; // mid(4) → OK (validate + publish)
+    pub const STATUS_OK: u8 = 0x00;
+    pub const STATUS_ERR: u8 = 0x01;
+    pub const DESC_WIRE: usize = 38; // MotaDesc wire size
+    pub const WRITE_MAX: usize = 512; // max data bytes per WRITE/SREAD
+
+    /// Fixed header length (bytes after `op`) for a request, or `None` for an unknown op. `OP_WRITE`
+    /// additionally carries `len` data bytes after its 10-byte header.
+    pub fn request_header_len(op: u8) -> Option<usize> {
+        Some(match op {
+            OP_COUNT => 0,
+            OP_DESCRIBE => 1,
+            OP_READ => 7,
+            OP_STAT | OP_FIN => 4,
+            OP_BEGIN => 8,
+            OP_SREAD | OP_WRITE => 10,
+            _ => return None,
+        })
+    }
+}
+
 /// Delta/full codec (`codec_id` in the manifest).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Codec {
