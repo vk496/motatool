@@ -34,7 +34,9 @@ fn serve_ops_count_describe_read() {
     let dir = tempfile::tempdir().unwrap();
     let mota = a_mota();
     std::fs::write(dir.path().join("fw.mota"), &mota).unwrap();
-    let folder = Folder::scan(dir.path(), true, |_, _| panic!("valid mota must not be skipped"));
+    let folder = Folder::scan(dir.path(), true, |_, _| {
+        panic!("valid mota must not be skipped")
+    });
     let core = SeederCore::new(folder, None);
 
     assert_eq!(core.handle(OP_COUNT, &[]), Some((STATUS_OK, vec![1])));
@@ -50,7 +52,10 @@ fn serve_ops_count_describe_read() {
     let mut read_args = vec![0u8]; // idx 0
     read_args.extend_from_slice(&0u32.to_le_bytes());
     read_args.extend_from_slice(&4u16.to_le_bytes());
-    assert_eq!(core.handle(OP_READ, &read_args), Some((STATUS_OK, MAGIC.to_vec())));
+    assert_eq!(
+        core.handle(OP_READ, &read_args),
+        Some((STATUS_OK, MAGIC.to_vec()))
+    );
 }
 
 #[test]
@@ -63,11 +68,14 @@ fn storage_capture_roundtrip_and_publish() {
     let mid: [u8; 4] = mota[HEADER_LEN + 20..HEADER_LEN + 24].try_into().unwrap();
 
     // STAT before begin → not present.
-    assert_eq!(core.handle(OP_STAT, &mid).unwrap(), (STATUS_OK, {
-        let mut p = vec![0u8];
-        p.extend_from_slice(&0u32.to_le_bytes());
-        p
-    }));
+    assert_eq!(
+        core.handle(OP_STAT, &mid).unwrap(),
+        (STATUS_OK, {
+            let mut p = vec![0u8];
+            p.extend_from_slice(&0u32.to_le_bytes());
+            p
+        })
+    );
 
     // BEGIN a .part of the full size, WRITE the whole container in ≤WRITE_MAX chunks, FIN.
     let mut begin = mid.to_vec();
@@ -76,7 +84,12 @@ fn storage_capture_roundtrip_and_publish() {
 
     for (i, chunk) in mota.chunks(WRITE_MAX).enumerate() {
         let off = (i * WRITE_MAX) as u32;
-        assert_eq!(core.handle(OP_WRITE, &req(&mid, off, chunk.len() as u16, chunk)).unwrap().0, STATUS_OK);
+        assert_eq!(
+            core.handle(OP_WRITE, &req(&mid, off, chunk.len() as u16, chunk))
+                .unwrap()
+                .0,
+            STATUS_OK
+        );
     }
 
     // SREAD a slice back → matches what we wrote.
@@ -89,7 +102,10 @@ fn storage_capture_roundtrip_and_publish() {
     // Published as <mid-lowercase>.mota, byte-for-byte what we streamed.
     let published = dir.path().join(format!("{}.mota", hex::encode(mid)));
     assert_eq!(std::fs::read(&published).unwrap(), mota);
-    assert!(!dir.path().join(format!("{}.mota.part", hex::encode(mid))).exists());
+    assert!(!dir
+        .path()
+        .join(format!("{}.mota.part", hex::encode(mid)))
+        .exists());
 }
 
 #[test]
@@ -111,6 +127,12 @@ fn begin_overlays_seed_payload_leaving_header_and_leaves_blank() {
     let part = std::fs::read(dir.path().join(format!("{}.mota.part", hex::encode(mid)))).unwrap();
     assert_eq!(part.len(), total);
     let payload_off = HEADER_LEN + MFL + block_count as usize * 4;
-    assert!(part[..payload_off].iter().all(|&b| b == 0xFF), "header + leaves stay 0xFF");
-    assert_eq!(&part[payload_off..payload_off + seed_payload.len()], &seed_payload[..]);
+    assert!(
+        part[..payload_off].iter().all(|&b| b == 0xFF),
+        "header + leaves stay 0xFF"
+    );
+    assert_eq!(
+        &part[payload_off..payload_off + seed_payload.len()],
+        &seed_payload[..]
+    );
 }
