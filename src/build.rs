@@ -1,17 +1,23 @@
 //! Assemble a `.mota` container from a firmware image.
 //!
-//! Phase 1 builds **full images** only. Delta encoding (`--base`) needs the detools encoder and is a
-//! separate, deferred piece — [`build`] returns a clear error for now rather than producing a bad container.
+//! Full images are 100% Rust. A **delta** (`--base`) diffs the base against the target with detools (see
+//! [`crate::delta`] — a dev-only dependency until a pure-Rust encoder lands): the container is identical
+//! except the payload is the detools patch, `codec_id` marks the patch type, and `base_hash` pins the
+//! image the delta must be applied to.
 
 use crate::crypto::{ed25519_public_from_seed, ed25519_sign, sha256};
-use crate::endf::{ensure_endf, parse_ident, version_str};
+use crate::delta::{self, InPlaceParams, PatchType};
+use crate::endf::{ensure_endf, has_endf, parse_ident, version_str};
 use crate::format::*;
 use crate::merkle;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 pub struct BuildOpts {
     pub fw: Vec<u8>,
     pub base: Option<Vec<u8>>,
+    pub patch_type: PatchType,   // delta layout; used iff base.is_some()
+    pub inplace_memory: u32,     // in-place apply window; used iff patch_type == InPlace
+    pub segment_size: u32,       // in-place segment; used iff patch_type == InPlace
     pub target_id: Option<u32>,  // overrides the EndF identity
     pub fw_version: Option<u32>, // overrides the EndF identity
     pub hw_id: Option<String>,   // overrides the EndF identity
@@ -27,11 +33,6 @@ pub struct Built {
 }
 
 pub fn build(o: &BuildOpts) -> Result<Built> {
-    if o.base.is_some() {
-        bail!("delta builds (--base) are not supported yet — full-image builds only");
-    }
-    let _ = o.force; // (only meaningful for the deferred cross-hardware delta guard)
-
     // Resolve identity: explicit flags win over the firmware's self-describing EndF trailer.
     let from_fw = parse_ident(&o.fw);
     let ident = FwIdent {
@@ -40,11 +41,18 @@ pub fn build(o: &BuildOpts) -> Result<Built> {
         hw_id: o.hw_id.clone().unwrap_or(from_fw.hw_id),
     };
 
+    // The target image (EndF-trailed) is what image_size/image_hash always describe.
     let (image, _body_hash) = ensure_endf(&o.fw, &ident);
-    let payload = &image; // full image: the payload IS the (EndF-trailed) image
-    let codec = Codec::Full;
 
-    let leaves = merkle::leaf_hashes(payload, o.block_size as usize);
+    // Full: the payload IS the image. Delta: the payload is a detools patch base_image -> image, and
+    // base_hash pins the running image it applies to (the device checks it against its EndF body_hash).
+    let (codec, payload, base_hash) = match &o.base {
+        None => (Codec::Full, image.clone(), [0u8; 8]),
+        Some(base_fw) => build_delta(o, &ident, &image, base_fw)?,
+    };
+    let is_full = codec == Codec::Full;
+
+    let leaves = merkle::leaf_hashes(&payload, o.block_size as usize);
     let block_count = leaves.len();
     if !(1..=0xFFFF).contains(&block_count) {
         bail!("payload yields an invalid block count ({block_count})");
@@ -56,7 +64,7 @@ pub fn build(o: &BuildOpts) -> Result<Built> {
     // ---- assemble the fixed 197-byte manifest ----
     let mut mf = [0u8; MFL];
     mf[off::FORMAT_VER] = FORMAT_VER;
-    mf[off::FLAGS] = MFLAG_FULL | if signed { MFLAG_SIGNED } else { 0 };
+    mf[off::FLAGS] = if is_full { MFLAG_FULL } else { 0 } | if signed { MFLAG_SIGNED } else { 0 };
     mf[off::HASH_ALGO] = HASH_ALGO_SHA256;
     wr_u32(&mut mf, off::TARGET_ID, ident.target_id);
     wr_u32(&mut mf, off::FW_VERSION, ident.fw_version);
@@ -69,7 +77,7 @@ pub fn build(o: &BuildOpts) -> Result<Built> {
     let hw = ident.hw_id.as_bytes();
     mf[off::HW_ID..off::HW_ID + hw.len().min(HW_ID_LEN)]
         .copy_from_slice(&hw[..hw.len().min(HW_ID_LEN)]);
-    // base_hash stays zero for a full image.
+    mf[off::BASE_HASH..off::BASE_HASH + 8].copy_from_slice(&base_hash); // zero for a full image
     if let Some(seed) = &o.sign_seed {
         mf[off::SIGNER..off::SIGNER + 32].copy_from_slice(&ed25519_public_from_seed(seed));
         let sig = ed25519_sign(seed, &mf[..SIGNED_LEN]);
@@ -85,7 +93,7 @@ pub fn build(o: &BuildOpts) -> Result<Built> {
     bytes.extend_from_slice(&(total as u32).to_le_bytes());
     bytes.extend_from_slice(&mf);
     bytes.extend_from_slice(&leaves_bytes);
-    bytes.extend_from_slice(payload);
+    bytes.extend_from_slice(&payload);
     bytes.extend_from_slice(&TRAILER);
 
     let manifest = Manifest::parse(&bytes)?; // our own output must parse
@@ -95,6 +103,48 @@ pub fn build(o: &BuildOpts) -> Result<Built> {
         suggested_name,
         manifest,
     })
+}
+
+/// Diff `base_fw` against the target `image` into a detools patch (the delta payload), returning the codec,
+/// that patch, and the 8-byte `base_hash` the device matches against its running image's EndF body hash.
+fn build_delta(
+    o: &BuildOpts,
+    ident: &FwIdent,
+    image: &[u8],
+    base_fw: &[u8],
+) -> Result<(Codec, Vec<u8>, [u8; 8])> {
+    // The delta must apply to the device's *actual* running image, which carries its own EndF trailer.
+    // Requiring one here stops a silently-wrong patch built against a re-stamped base (it would fail the
+    // on-device base_hash check anyway, but failing early is clearer).
+    if !has_endf(base_fw) {
+        bail!(
+            "--base must be a real firmware image with its EndF trailer (the device's running image); \
+             this one has none"
+        );
+    }
+    let base_ident = parse_ident(base_fw);
+    if !o.force && base_ident.hw_id != ident.hw_id {
+        bail!(
+            "base hardware {:?} != target hardware {:?}; a cross-hardware delta will not apply (use --force to override)",
+            base_ident.hw_id,
+            ident.hw_id
+        );
+    }
+    let (base_image, base_hash) = ensure_endf(base_fw, &base_ident);
+
+    let (codec, ip) = match o.patch_type {
+        PatchType::Sequential => (Codec::DetoolsSequential, None),
+        PatchType::InPlace => (
+            Codec::DetoolsInplace,
+            Some(InPlaceParams {
+                memory_size: o.inplace_memory,
+                segment_size: o.segment_size,
+            }),
+        ),
+    };
+    let patch = delta::encode_patch(&base_image, image, o.patch_type, ip)
+        .context("detools delta encode failed")?;
+    Ok((codec, patch, base_hash))
 }
 
 /// log2 of a power-of-two block size (1024 → 10).

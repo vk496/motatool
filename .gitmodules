@@ -1,0 +1,3 @@
+[submodule "third_party/detools"]
+	path = third_party/detools
+	url = https://github.com/eerimoq/detools

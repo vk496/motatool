@@ -1,12 +1,28 @@
 //! motatool CLI.
 
 use anyhow::{bail, Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use motatool::crypto::{ed25519_keygen, load_key32};
 use motatool::endf::{pack_version, target_id_for_env, version_str};
 use motatool::input::read_input;
 use motatool::serve::{open_serial, open_tcp, serve_loop, Folder, SeederCore};
-use motatool::{build, targets, verify, BuildOpts, Codec, Manifest};
+use motatool::{build, targets, verify, BuildOpts, Codec, Manifest, PatchType};
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CliPatchType {
+    Sequential,
+    #[value(name = "in-place")]
+    InPlace,
+}
+
+impl From<CliPatchType> for PatchType {
+    fn from(c: CliPatchType) -> Self {
+        match c {
+            CliPatchType::Sequential => PatchType::Sequential,
+            CliPatchType::InPlace => PatchType::InPlace,
+        }
+    }
+}
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -46,9 +62,19 @@ struct BuildArgs {
     /// NEW firmware: a file path or an http(s):// URL. A .hex is parsed to its flat image.
     #[arg(long)]
     fw: String,
-    /// Previous firmware to diff against → a delta (not yet supported; omit for a full image).
+    /// Previous firmware to diff against → a delta patch (omit for a full image). Must be a real image
+    /// with its EndF trailer — the device applies the delta to exactly this running image.
     #[arg(long)]
     base: Option<String>,
+    /// Delta patch layout (with --base): `sequential` (ESP32 A/B) or `in-place` (nRF52 single-slot).
+    #[arg(long = "patch-type", default_value = "sequential")]
+    patch_type: CliPatchType,
+    /// In-place apply window in bytes; must match the device bootloader (nRF52 default 0x98000).
+    #[arg(long = "inplace-memory", default_value = "0x98000")]
+    inplace_memory: String,
+    /// In-place segment size in bytes (default one nRF52 flash page).
+    #[arg(long = "segment-size", default_value_t = 4096)]
+    segment_size: u32,
     /// PlatformIO env name, hashed into the target id (overrides the firmware's EndF).
     #[arg(long = "target-env", conflicts_with = "target_id")]
     target_env: Option<String>,
@@ -172,6 +198,9 @@ fn cmd_build(a: BuildArgs) -> Result<()> {
     let built = build(&BuildOpts {
         fw,
         base,
+        patch_type: a.patch_type.into(),
+        inplace_memory: parse_u32_auto(&a.inplace_memory).context("--inplace-memory")?,
+        segment_size: a.segment_size,
         target_id,
         fw_version,
         hw_id: a.hw_id,

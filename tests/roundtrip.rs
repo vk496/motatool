@@ -3,7 +3,7 @@
 //! firmware with both tools and comparing — see the README.)
 
 use motatool::crypto::ed25519_public_from_seed;
-use motatool::{build, verify, BuildOpts, Manifest};
+use motatool::{build, verify, BuildOpts, Manifest, PatchType};
 
 fn synthetic_fw(n: usize) -> Vec<u8> {
     (0..n)
@@ -15,6 +15,9 @@ fn opts(fw: Vec<u8>) -> BuildOpts {
     BuildOpts {
         fw,
         base: None,
+        patch_type: PatchType::Sequential,
+        inplace_memory: 0,
+        segment_size: 0,
         target_id: Some(0x04D4_13FD),
         fw_version: Some(0x0111_0000),
         hw_id: Some("RAK4631".into()),
@@ -71,11 +74,15 @@ fn payload_tamper_is_detected() {
 }
 
 #[test]
-fn delta_build_is_rejected_for_now() {
+fn delta_base_without_endf_is_rejected() {
+    // A delta must be built against the device's real running image, which carries an EndF trailer.
+    // A raw base with no trailer is refused rather than producing a patch that could never apply.
+    // (The full delta apply-equivalence round-trip lives in tests/delta.rs, gated on the dev detools.)
     let mut o = opts(synthetic_fw(2500));
-    o.base = Some(synthetic_fw(2400));
+    o.base = Some(synthetic_fw(2400)); // no EndF trailer
+    let err = build(&o).err().expect("delta must error").to_string();
     assert!(
-        build(&o).is_err(),
-        "delta builds are deferred and must error, not misbuild"
+        err.contains("EndF"),
+        "expected an EndF-base error, got: {err}"
     );
 }

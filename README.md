@@ -17,8 +17,8 @@ Ported and validated:
 | `verify` | ✅ (structure, block hashes, merkle root, image hash, Ed25519 signature) |
 | `inspect` | ✅ |
 | `keygen` | ✅ |
-| `build --base` (delta) | ⏳ deferred — see [Deltas](#deltas) |
-| `serve` (USB/WiFi seeder link) | ⏳ next |
+| `serve` (USB/WiFi seeder link) | ✅ (folder relay + pull-to-folder capture + `--seed` warm-start) |
+| `build --base` (delta) | ✅ via detools (**dev-only** backend); apply-equivalence tested — see [Deltas](#deltas) |
 
 ## Build
 
@@ -64,11 +64,35 @@ firmware with this tool and the reference C++ `motatool` and confirming the outp
 
 ## Deltas
 
-Delta builds (`--base`) are deferred, on purpose. MeshCore deltas use the **detools** *sequential* / *in-place*
-patch format, which the firmware/bootloader decodes with detools' vendored **C decoder**. detools has **no C
-encoder** — patch *creation* lives in its Python `create.py` — so a byte-compatible encoder must call detools
-(pinned as a git submodule) rather than reimplement the codec. Full-image builds (the common case, and the
-warm-start capture flow) need none of this and are pure Rust.
+```sh
+# diff a NEW firmware against the device's current image -> a tiny delta .mota
+motatool build --base running_firmware.bin --fw new_firmware.bin --out-dir ./motas                 # sequential (ESP32)
+motatool build --base running_firmware.bin --fw new_firmware.bin --patch-type in-place --out-dir . # in-place (nRF52)
+```
+
+`--base` must be the device's **real running image, with its `EndF` trailer** — the delta is applied to
+exactly that image on-device, and its 8-byte `base_hash` is checked against the running firmware before apply.
+The delta payload is a **detools** patch (`--compression crle`, matching the firmware's compile-time decoder
+config); `--patch-type in-place` also takes `--inplace-memory` (nRF52 default `0x98000`) and `--segment-size`.
+
+**detools is a development-only dependency.** MeshCore's device/bootloader decodes deltas with detools'
+vendored **C decoder**, but detools has **no C/Rust encoder** — patch *creation* lives in its Python
+`create.py`. So, for now, `build --base` shells out to the pinned detools (git submodule
+`third_party/detools`) through `scripts/detools_shim.py`. Set it up once:
+
+```sh
+make dev-setup     # inits the submodule + builds a local .venv with detools 0.53.0
+```
+
+Everything else — full-image `build`, `verify`, `inspect`, `serve` — is **pure Rust and needs none of this**.
+
+### Correctness: apply-equivalence, not byte-identity
+
+A delta is correct when the **real detools decoder**, fed our patch, reconstructs the target byte-for-byte —
+*not* when our patch bytes equal detools'. `tests/delta.rs` asserts exactly that, for both patch types:
+`apply(base, our_patch) == apply(base, detools_patch) == target`. That is the contract a future **pure-Rust
+encoder** must satisfy; when it lands it replaces the shim with no `.mota` format change, and detools drops to
+a test-only oracle (or frozen golden vectors), leaving the shipped binary Python-free even for deltas.
 
 ## License
 

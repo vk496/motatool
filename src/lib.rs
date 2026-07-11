@@ -6,6 +6,7 @@
 
 pub mod build;
 pub mod crypto;
+pub mod delta;
 pub mod endf;
 pub mod format;
 pub mod input;
@@ -15,5 +16,6 @@ pub mod targets;
 pub mod verify;
 
 pub use build::{build, BuildOpts, Built};
+pub use delta::{InPlaceParams, PatchType};
 pub use format::{Codec, FwIdent, Manifest};
 pub use verify::verify;
