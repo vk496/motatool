@@ -1,32 +1,37 @@
 # motatool
 
-Build, verify, inspect, and (soon) serve **MeshCore `.mota` firmware-update containers**.
+Build, verify, inspect, and serve **MeshCore `.mota` firmware-update containers**.
 
 A `.mota` is a signed, self-verifying package of a firmware update that [MeshCore](https://github.com/meshcore-dev/MeshCore)
-nodes fetch over LoRa, block by block. This tool makes those packages, checks them, and serves a folder of
-them to a node. It is a Rust rewrite of the C++ `motatool` that used to live in the MeshCore tree, kept
-**byte-for-byte compatible** with the firmware's on-wire format.
+nodes fetch over LoRa, block by block. This tool makes those packages, checks them, serves a folder of them
+to a node, and diffs firmware into tiny delta updates. It is a Rust rewrite of the C++ `motatool` that used
+to live in the MeshCore tree, kept **byte-for-byte compatible** with the firmware's on-wire format.
 
 ## Status
 
-Ported and validated:
-
 | Command | State |
 |---|---|
-| `build` (full image) | ✅ byte-identical to the reference C++ tool |
-| `verify` | ✅ (structure, block hashes, merkle root, image hash, Ed25519 signature) |
-| `inspect` | ✅ |
-| `keygen` | ✅ |
-| `serve` (USB/WiFi seeder link) | ✅ (folder relay + pull-to-folder capture + `--seed` warm-start) |
-| `build --base` sequential (ESP32) | ✅ **pure Rust** (no runtime detools); apply-equivalence tested — see [Deltas](#deltas) |
-| `build --base` in-place (nRF52) | ✅ **pure Rust** (no runtime detools); apply-equivalence tested |
+| `build` (full image) | ✅ byte-identical to the firmware's own output |
+| `build --base` sequential (ESP32) | ✅ **pure Rust** delta (no runtime detools) — see [Deltas](#deltas) |
+| `build --base` in-place (nRF52) | ✅ **pure Rust** delta (no runtime detools) — see [Deltas](#deltas) |
+| `verify` | ✅ structure, block hashes, merkle root, image hash, Ed25519 signature |
+| `inspect` | ✅ dump every manifest field |
+| `keygen` | ✅ Ed25519 signing keypair |
+| `serve` (USB serial + WiFi TCP) | ✅ folder relay + pull-to-folder capture + `--seed` warm-start — see [Serve](#serve) |
+
+The full feature set of the old C++ tool, plus pure-Rust delta encoding (which the C++ tool never had).
 
 ## Build
 
 ```sh
-cargo build --release      # -> target/release/motatool
+cargo build --release      # -> target/release/motatool   (pure Rust; no Python/detools needed)
 cargo test                 # unit + round-trip tests
+make dev-setup             # OPTIONAL: build the detools test oracle so the delta tests run (see Deltas)
 ```
+
+The shipped binary has **no Python or detools dependency** for anything — `make dev-setup` is only needed to
+run the delta correctness tests, which decode our patches with the real detools decoder. Without it those
+tests skip cleanly.
 
 ## Usage
 
@@ -45,20 +50,56 @@ motatool inspect ./motas/RAK4631_04D413FD_v1.17.0_full_ABCD1234.mota
 
 # make an Ed25519 signing keypair
 motatool keygen --out signer.key   # writes signer.key + signer.key.pub (hex)
+
+# serve a folder of .mota to a node (relay updates to the mesh / capture a device's firmware)
+motatool serve --dir ./motas --serial /dev/ttyACM0 -v          # over USB serial
+motatool serve --dir ./motas --tcp 192.168.1.50:5001 -v        # over WiFi (ESP32 companion)
 ```
 
 `--fw` accepts a file path or an `http(s)://` URL; a `.hex` (nRF52/STM32 build) is parsed to its flat image
 first. Firmware identity comes from the image's `EndF` trailer, overridable with `--target-env` /
 `--target-id`, `--fw-version`, `--hw-id`.
 
+## Serve
+
+`serve` turns your computer into a **seeder** for a connected node, over its **USB serial** console or, for
+an ESP32 WiFi companion, over **WiFi (TCP)** — speaking the same `mota-seeder` protocol as the firmware:
+
+```sh
+motatool serve --dir ./firmware/ --serial /dev/ttyACM0 -v      # USB
+motatool serve --dir ./firmware/ --tcp 192.168.1.50:5001 -v    # WiFi seeder port (default 5001)
+```
+
+It does two things at once on that one link:
+
+- **Relay** — hands out every valid `.mota` in `--dir` to the node, which then advertises those updates to
+  its neighbours (who can `ota get` them like any other). No storage needed on the node.
+- **Capture (pull-to-folder)** — when the node runs `ota pull <#> folder`, it streams the fetched image
+  back; `serve` writes it as `<mid>.mota.part` and publishes it to `<mid>.mota` when complete. This is how
+  you pull a *remote* device's exact firmware down to your computer over the mesh.
+
+**Warm-start** (`--seed <similar.mota>`) makes capture fast: it stages a similar build's payload into each
+`.part`, so `ota pull <#> folder validate` on the node diffs it against the target's authenticated merkle
+leaves and pulls only the **differing** blocks over LoRa — a byte-exact capture in seconds instead of a full
+slow transfer. Other flags: `--baud` (serial speed), `--no-recursive` (don't descend into sub-folders),
+`--no-enable` (don't auto-send `ota folder on`/`off` on the serial console), `-v` (log each request).
+
+The transport is decoupled from the protocol (a `SeederCore` turns each `(op, args)` request into a reply,
+framed separately for serial/TCP), so the same core could back a future BLE/GATT path.
+
 ## Compatibility
 
 The container format, merkle tree (MMR of 4-byte truncated-SHA-256 leaves), `EndF` identity trailer, and
-hash truncation are held **byte-identical** to the MeshCore firmware (`src/helpers/ota/OtaFormat.h`,
-`MerkleTree.cpp`, and `docs/ota_protocol.md` are the spec). Ed25519 signing is deterministic (RFC 8032), so
-signed containers match the firmware's / OpenSSL's output exactly. This is validated by building the same
-firmware with this tool and the reference C++ `motatool` and confirming the outputs are byte-for-byte equal
-(and that each tool verifies the other's).
+hash truncation are held **byte-identical** to the MeshCore firmware — the spec is
+[`docs/ota_protocol.md`](https://github.com/meshcore-dev/MeshCore/blob/main/docs/ota_protocol.md) plus
+`src/helpers/ota/OtaFormat.h` / `MerkleTree.cpp` in the firmware tree. Ed25519 signing is deterministic
+(RFC 8032), so signed containers match the firmware's / OpenSSL's output exactly.
+
+Byte-exact equivalence was validated during the port against the reference C++ `motatool` (same firmware
+built with both tools → byte-for-byte-identical `.mota`, each verifying the other's), and the delta encoders
+are validated on every test run against the real detools decoder (see [Deltas](#deltas)). The C++ tool has
+since been removed from the MeshCore tree in favour of this one; the shared contract is the `.mota` spec, not
+any code dependency — MeshCore does not depend on motatool, nor motatool on MeshCore.
 
 `src/targets.rs` is a vendored snapshot of the firmware's generated `OtaTargets.h`
 (`target_id = sha2-256:4(env_name)`); regenerate it from there when the OTA-capable env set changes.
