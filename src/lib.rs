@@ -7,6 +7,7 @@
 pub mod build;
 pub mod crypto;
 pub mod delta;
+pub mod encode;
 pub mod endf;
 pub mod format;
 pub mod input;

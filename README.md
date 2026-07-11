@@ -18,7 +18,8 @@ Ported and validated:
 | `inspect` | ✅ |
 | `keygen` | ✅ |
 | `serve` (USB/WiFi seeder link) | ✅ (folder relay + pull-to-folder capture + `--seed` warm-start) |
-| `build --base` (delta) | ✅ via detools (**dev-only** backend); apply-equivalence tested — see [Deltas](#deltas) |
+| `build --base` sequential (ESP32) | ✅ **pure Rust** (no runtime detools); apply-equivalence tested — see [Deltas](#deltas) |
+| `build --base` in-place (nRF52) | ✅ via detools (**dev-only** backend); pure-Rust port is future work |
 
 ## Build
 
@@ -75,24 +76,37 @@ exactly that image on-device, and its 8-byte `base_hash` is checked against the 
 The delta payload is a **detools** patch (`--compression crle`, matching the firmware's compile-time decoder
 config); `--patch-type in-place` also takes `--inplace-memory` (nRF52 default `0x98000`) and `--segment-size`.
 
-**detools is a development-only dependency.** MeshCore's device/bootloader decodes deltas with detools'
-vendored **C decoder**, but detools has **no C/Rust encoder** — patch *creation* lives in its Python
-`create.py`. So, for now, `build --base` shells out to the pinned detools (git submodule
-`third_party/detools`) through `scripts/detools_shim.py`. Set it up once:
+**Sequential (ESP32) is pure Rust** — [`src/encode.rs`](src/encode.rs) implements the detools
+`sequential` + `crle` format (canonical bsdiff + conditional-RLE), so `build --base --patch-type sequential`
+needs **no Python or detools at runtime**. The **in-place (nRF52)** path still shells out to the pinned
+detools (git submodule `third_party/detools`) via `scripts/detools_shim.py`; porting it is future work. That
+one path, plus the test oracle, is the only reason to install detools:
 
 ```sh
 make dev-setup     # inits the submodule + builds a local .venv with detools 0.53.0
 ```
 
-Everything else — full-image `build`, `verify`, `inspect`, `serve` — is **pure Rust and needs none of this**.
+detools is a **development/test-only** dependency. Full-image `build`/`verify`/`inspect`/`serve` and the
+pure-Rust sequential delta need none of it.
 
 ### Correctness: apply-equivalence, not byte-identity
 
-A delta is correct when the **real detools decoder**, fed our patch, reconstructs the target byte-for-byte —
-*not* when our patch bytes equal detools'. `tests/delta.rs` asserts exactly that, for both patch types:
-`apply(base, our_patch) == apply(base, detools_patch) == target`. That is the contract a future **pure-Rust
-encoder** must satisfy; when it lands it replaces the shim with no `.mota` format change, and detools drops to
-a test-only oracle (or frozen golden vectors), leaving the shipped binary Python-free even for deltas.
+A delta is correct when the **real detools C decoder** (the one on the device), fed our patch, reconstructs
+the target **byte-for-byte** — *not* when our patch bytes equal detools'. Because a single wrong bit corrupts
+a firmware image, the encoder is held to that directly:
+
+- `tests/encode.rs` runs a **deterministic sweep** (seeded PRNG + fixed edit scripts across lengths 0…20 k:
+  identical, scattered edits, insert/delete/append/prepend, truncate/grow, wholly-different, empty edges,
+  run-heavy). Every generated patch is decoded by real detools and **hash-compared** to the exact target,
+  and cross-checked so `apply(base, our_patch) == apply(base, detools_patch) == target`.
+- The `crle` compressor is round-tripped through the real detools decompressor; `pack_size`/`crle` framing
+  have unit tests; the encoder is proven deterministic and thread-safe under concurrent load.
+- Validated at scale: a ~500 KB image with ~55 edits → an **829-byte** delta in ~0.2 s, reconstructed
+  byte-exact by detools.
+
+The in-place path is held to the same apply-equivalence bar in `tests/delta.rs`. When the in-place encoder is
+ported to Rust, detools drops to a pure test oracle (or frozen vectors), leaving the shipped binary
+Python-free for all delta types.
 
 ## License
 

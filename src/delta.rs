@@ -130,6 +130,25 @@ pub fn available() -> bool {
     run_shim(&["--detools-version".into()]).is_ok()
 }
 
+/// Decompress a `crle` stream with the **real** detools decompressor (test oracle for the pure-Rust crle
+/// compressor). `size` is the expected decompressed length.
+pub fn crle_decompress(data: &[u8], size: usize) -> Result<Vec<u8>> {
+    let dir = scratch()?;
+    let in_f = dir.join("in.crle");
+    let out_f = dir.join("out.bin");
+    std::fs::write(&in_f, data)?;
+    run_shim(&[
+        "crle-decompress".into(),
+        path(&in_f),
+        path(&out_f),
+        "--size".into(),
+        size.to_string(),
+    ])?;
+    let out = std::fs::read(&out_f)?;
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(out)
+}
+
 /// The Python that has the pinned detools installed. Override with `$MOTATOOL_DETOOLS_PYTHON`; defaults to
 /// the repo dev venv if present, else `python3`.
 fn detools_python() -> String {

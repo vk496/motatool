@@ -39,6 +39,20 @@ def cmd_encode(a):
         f.write(out.getvalue())
 
 
+def cmd_crle_decompress(a):
+    """Oracle: decompress a crle stream with the real detools CrleDecompressor (proves our crle output is a
+    valid detools stream). `--size` is the expected decompressed length."""
+    from detools.compression.crle import CrleDecompressor
+
+    comp = _read(a.data)
+    dec = CrleDecompressor(len(comp))
+    out = b""
+    while len(out) < a.size:
+        out += dec.decompress(comp if dec.needs_input else b"", a.size - len(out))
+    with open(a.out, "wb") as f:
+        f.write(out)
+
+
 def cmd_apply(a):
     """Oracle: apply `patch` to `base` with the real detools decoder, write the target."""
     base, patch = _read(a.base), _read(a.patch)
@@ -77,6 +91,11 @@ def main():
     ap.add_argument("--memory-size", type=int, default=0)
     ap.add_argument("--to-size", type=int, default=0)
     ap.set_defaults(func=cmd_apply)
+
+    cd = sub.add_parser("crle-decompress", help="decompress a crle stream with the real detools decoder")
+    cd.add_argument("data"); cd.add_argument("out")
+    cd.add_argument("--size", type=int, required=True)
+    cd.set_defaults(func=cmd_crle_decompress)
 
     a = p.parse_args()
     if a.detools_version:

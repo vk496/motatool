@@ -132,18 +132,23 @@ fn build_delta(
     }
     let (base_image, base_hash) = ensure_endf(base_fw, &base_ident);
 
-    let (codec, ip) = match o.patch_type {
-        PatchType::Sequential => (Codec::DetoolsSequential, None),
-        PatchType::InPlace => (
-            Codec::DetoolsInplace,
-            Some(InPlaceParams {
+    let (codec, patch) = match o.patch_type {
+        // Sequential is the pure-Rust encoder (no detools/Python at runtime).
+        PatchType::Sequential => (
+            Codec::DetoolsSequential,
+            crate::encode::encode_sequential(&base_image, image),
+        ),
+        // In-place still goes through the dev-only detools shim (pure-Rust port is future work).
+        PatchType::InPlace => {
+            let ip = InPlaceParams {
                 memory_size: o.inplace_memory,
                 segment_size: o.segment_size,
-            }),
-        ),
+            };
+            let patch = delta::encode_patch(&base_image, image, o.patch_type, Some(ip))
+                .context("detools in-place delta encode failed")?;
+            (Codec::DetoolsInplace, patch)
+        }
     };
-    let patch = delta::encode_patch(&base_image, image, o.patch_type, ip)
-        .context("detools delta encode failed")?;
     Ok((codec, patch, base_hash))
 }
 
