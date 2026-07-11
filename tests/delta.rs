@@ -1,17 +1,16 @@
-//! Delta (`build --base`) end-to-end + the apply-equivalence guarantee.
+//! Delta (`build --base`) end-to-end: the full `.mota` assembly + the apply-equivalence guarantee.
 //!
-//! The property that matters on-device is NOT that our patch bytes equal detools' — it's that the **real
-//! detools decoder**, fed our patch, reconstructs the target byte-for-byte (and equals what it would
-//! reconstruct from detools' own patch). That's what these tests assert, over the two patch types the
-//! firmware uses (`sequential` for ESP32 A/B, `in-place` for the nRF52 single-slot bootloader).
-//!
-//! Gated on the dev-only detools backend: on a bare checkout (no `make dev-setup`) they skip with a note
-//! rather than fail. This is exactly the harness a future pure-Rust encoder must keep green.
+//! Complements `tests/encode.rs` (which drives the raw encoders): here we build a real signed-layout delta
+//! container and check the manifest wiring (codec, base_hash, image_size/hash) plus that the payload — the
+//! detools patch — reconstructs the target byte-for-byte under the real detools decoder, for both patch
+//! types. Gated on the dev detools oracle; skips cleanly without it.
+
+mod common;
 
 use motatool::endf::ensure_endf;
-use motatool::{build, delta, verify, BuildOpts, Codec, FwIdent, Manifest, PatchType};
+use motatool::{build, verify, BuildOpts, Codec, FwIdent, Manifest, PatchType};
 
-const MEM: u32 = 0x8000; // in-place window for the tiny test images (> target size)
+const MEM: u32 = 0x8000; // in-place window for the tiny test images (> base+target)
 const SEG: u32 = 0x1000;
 
 fn ident() -> FwIdent {
@@ -75,29 +74,19 @@ fn assert_delta_roundtrips(ptype: PatchType, expect_codec: Codec) {
     let payload = &built.bytes[m.payload_off()..m.payload_off() + m.payload_size as usize];
 
     // APPLY-EQUIVALENCE: real detools decoder over (base, our payload) == the target image, byte-for-byte.
-    let rebuilt = delta::apply_patch(&base_image, payload, ptype, MEM, target_image.len() as u32)
-        .expect("detools apply");
+    let rebuilt = common::apply(&base_image, payload, ptype, MEM, target_image.len() as u32);
     assert_eq!(rebuilt, target_image, "decoded image must equal the target");
 
-    // ...and equal to what detools reconstructs from ITS OWN patch (the property is decoder-output equality,
-    // independent of how the patch was produced — the invariant a pure-Rust encoder must also satisfy).
-    let ip = if ptype == PatchType::InPlace {
-        Some(motatool::InPlaceParams {
-            memory_size: MEM,
-            segment_size: SEG,
-        })
-    } else {
-        None
-    };
-    let ref_patch = delta::encode_patch(&base_image, &target_image, ptype, ip).expect("ref encode");
-    let ref_rebuilt = delta::apply_patch(
+    // ...and equal to what detools reconstructs from ITS OWN patch (decoder-output equality, independent of
+    // how the patch was produced — the invariant the pure-Rust encoder must satisfy).
+    let ref_patch = common::encode(&base_image, &target_image, ptype, MEM, SEG);
+    let ref_rebuilt = common::apply(
         &base_image,
         &ref_patch,
         ptype,
         MEM,
         target_image.len() as u32,
-    )
-    .unwrap();
+    );
     assert_eq!(
         rebuilt, ref_rebuilt,
         "our patch and detools' patch must decode identically"
@@ -113,7 +102,7 @@ fn assert_delta_roundtrips(ptype: PatchType, expect_codec: Codec) {
 
 #[test]
 fn sequential_delta_applies_to_target() {
-    if !delta::available() {
+    if !common::available() {
         eprintln!("SKIP: detools backend unavailable (run `make dev-setup`)");
         return;
     }
@@ -122,8 +111,8 @@ fn sequential_delta_applies_to_target() {
 
 #[test]
 fn in_place_delta_applies_to_target() {
-    if !delta::available() {
-        eprintln!("SKIP: detools backend unavailable (run `make dev-setup`)");
+    if !common::available() {
+        eprintln!("SKIP: detools backend unavailable");
         return;
     }
     assert_delta_roundtrips(PatchType::InPlace, Codec::DetoolsInplace);
@@ -131,7 +120,7 @@ fn in_place_delta_applies_to_target() {
 
 #[test]
 fn delta_suggested_name_tags_the_codec() {
-    if !delta::available() {
+    if !common::available() {
         eprintln!("SKIP: detools backend unavailable");
         return;
     }

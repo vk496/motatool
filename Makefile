@@ -1,9 +1,9 @@
 # motatool — dev tasks.
 #
-# The tool itself is pure Rust (`cargo build`). Only DELTA builds (`build --base`) need the pinned
-# `detools` encoder, and only during development — it is not required to build/verify/inspect/serve full
-# images, and won't be needed for deltas once a pure-Rust encoder lands. `dev-setup` builds a local venv
-# with detools from the third_party/detools submodule; the tests and the delta path find it automatically.
+# The tool itself is pure Rust (`cargo build`) — including both delta encoders (`build --base`), which need
+# NO detools/Python at runtime. detools is only the test ORACLE: the delta tests decode our patches with the
+# real detools decoder to prove byte-exact apply-equivalence. `dev-setup` builds a local venv with detools
+# from the third_party/detools submodule; the tests find it automatically (and skip cleanly without it).
 
 PY ?= python3
 VENV := .venv

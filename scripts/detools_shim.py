@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
-"""Thin, dev-only bridge between motatool and the pinned `detools` encoder/decoder.
+"""Thin, TEST-ONLY bridge between motatool's tests and the pinned `detools`.
 
-This is the ONLY place motatool touches detools. It exists for two reasons:
+motatool's own delta encoders are pure Rust (`src/encode.rs`); the shipped binary never
+runs this. It exists solely as the independent test **oracle**:
 
-  * `encode` — option B: motatool shells out here to produce a byte-compatible detools
-    patch (`--codec sequential|in-place --compression crle`) until a pure-Rust encoder
-    replaces it. Mirrors exactly how MeshCore's `tools/mota/gen_vectors.py` calls detools,
-    so the produced patch is what the on-device vendored detools C decoder expects.
-  * `apply` — the *test oracle*: reconstruct `new` from `old` + patch with the real
-    detools decoder, so a Rust-produced patch can be proven apply-equivalent
+  * `apply` — reconstruct `new` from `old` + patch with the real detools decoder (the
+    on-device counterpart), so a Rust-produced patch is proven apply-equivalent
     (`apply(old, ours) == apply(old, detools) == new`), byte for byte.
+  * `encode` — produce detools' OWN reference patch (`--codec sequential|in-place
+    --compression crle`) for the cross-check, mirroring MeshCore's `tools/mota/gen_vectors.py`.
+  * `crle-decompress` — decode our crle output with the real detools decompressor.
 
-detools (and this shim) is a **development/test dependency only** — the shipped
-`motatool` binary never needs it for the full-image path, and won't need it for deltas
-once the pure-Rust encoder lands. Run under the venv built from `third_party/detools`
-(see the Makefile `dev-setup` target).
+Run under the venv built from `third_party/detools` (see the Makefile `dev-setup` target).
+Invoked only from `tests/common/mod.rs`; the tests skip when it is unavailable.
 """
 import argparse
 import io

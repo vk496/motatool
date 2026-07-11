@@ -6,11 +6,11 @@
 //! image the delta must be applied to.
 
 use crate::crypto::{ed25519_public_from_seed, ed25519_sign, sha256};
-use crate::delta::{self, InPlaceParams, PatchType};
+use crate::encode::PatchType;
 use crate::endf::{ensure_endf, has_endf, parse_ident, version_str};
 use crate::format::*;
 use crate::merkle;
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
 pub struct BuildOpts {
     pub fw: Vec<u8>,
@@ -132,21 +132,29 @@ fn build_delta(
     }
     let (base_image, base_hash) = ensure_endf(base_fw, &base_ident);
 
+    // Both patch types are the pure-Rust encoder now — no detools/Python at runtime.
     let (codec, patch) = match o.patch_type {
-        // Sequential is the pure-Rust encoder (no detools/Python at runtime).
         PatchType::Sequential => (
             Codec::DetoolsSequential,
             crate::encode::encode_sequential(&base_image, image),
         ),
-        // In-place still goes through the dev-only detools shim (pure-Rust port is future work).
         PatchType::InPlace => {
-            let ip = InPlaceParams {
-                memory_size: o.inplace_memory,
-                segment_size: o.segment_size,
-            };
-            let patch = delta::encode_patch(&base_image, image, o.patch_type, Some(ip))
-                .context("detools in-place delta encode failed")?;
-            (Codec::DetoolsInplace, patch)
+            if o.segment_size == 0 || o.inplace_memory % o.segment_size != 0 {
+                bail!(
+                    "in-place: --inplace-memory ({}) must be a non-zero multiple of --segment-size ({})",
+                    o.inplace_memory,
+                    o.segment_size
+                );
+            }
+            (
+                Codec::DetoolsInplace,
+                crate::encode::encode_in_place(
+                    &base_image,
+                    image,
+                    o.inplace_memory,
+                    o.segment_size,
+                ),
+            )
         }
     };
     Ok((codec, patch, base_hash))

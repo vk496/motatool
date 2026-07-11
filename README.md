@@ -19,7 +19,7 @@ Ported and validated:
 | `keygen` | ✅ |
 | `serve` (USB/WiFi seeder link) | ✅ (folder relay + pull-to-folder capture + `--seed` warm-start) |
 | `build --base` sequential (ESP32) | ✅ **pure Rust** (no runtime detools); apply-equivalence tested — see [Deltas](#deltas) |
-| `build --base` in-place (nRF52) | ✅ via detools (**dev-only** backend); pure-Rust port is future work |
+| `build --base` in-place (nRF52) | ✅ **pure Rust** (no runtime detools); apply-equivalence tested |
 
 ## Build
 
@@ -76,37 +76,36 @@ exactly that image on-device, and its 8-byte `base_hash` is checked against the 
 The delta payload is a **detools** patch (`--compression crle`, matching the firmware's compile-time decoder
 config); `--patch-type in-place` also takes `--inplace-memory` (nRF52 default `0x98000`) and `--segment-size`.
 
-**Sequential (ESP32) is pure Rust** — [`src/encode.rs`](src/encode.rs) implements the detools
-`sequential` + `crle` format (canonical bsdiff + conditional-RLE), so `build --base --patch-type sequential`
-needs **no Python or detools at runtime**. The **in-place (nRF52)** path still shells out to the pinned
-detools (git submodule `third_party/detools`) via `scripts/detools_shim.py`; porting it is future work. That
-one path, plus the test oracle, is the only reason to install detools:
+**Both patch types are pure Rust** — [`src/encode.rs`](src/encode.rs) implements the detools
+`sequential` + `crle` (ESP32 A/B) and `in-place` + `crle` (nRF52 single-slot) formats (canonical bsdiff +
+conditional-RLE + the shift/segment layout), so `build --base` needs **no Python or detools at runtime** for
+either. The full-image `build`/`verify`/`inspect`/`serve` paths never did.
+
+detools is therefore a **development/test-only** dependency — the independent oracle the encoder is proven
+against, nothing the shipped binary calls. Install it once to run the delta tests:
 
 ```sh
-make dev-setup     # inits the submodule + builds a local .venv with detools 0.53.0
+make dev-setup     # inits the third_party/detools submodule + builds a local .venv with detools 0.53.0
 ```
-
-detools is a **development/test-only** dependency. Full-image `build`/`verify`/`inspect`/`serve` and the
-pure-Rust sequential delta need none of it.
 
 ### Correctness: apply-equivalence, not byte-identity
 
 A delta is correct when the **real detools C decoder** (the one on the device), fed our patch, reconstructs
 the target **byte-for-byte** — *not* when our patch bytes equal detools'. Because a single wrong bit corrupts
-a firmware image, the encoder is held to that directly:
+a firmware image, the encoders are held to that directly:
 
 - `tests/encode.rs` runs a **deterministic sweep** (seeded PRNG + fixed edit scripts across lengths 0…20 k:
   identical, scattered edits, insert/delete/append/prepend, truncate/grow, wholly-different, empty edges,
-  run-heavy). Every generated patch is decoded by real detools and **hash-compared** to the exact target,
-  and cross-checked so `apply(base, our_patch) == apply(base, detools_patch) == target`.
+  run-heavy), for **both patch types**. Every generated patch is decoded by real detools and **hash-compared**
+  to the exact target, and cross-checked so `apply(base, our_patch) == apply(base, detools_patch) == target`.
 - The `crle` compressor is round-tripped through the real detools decompressor; `pack_size`/`crle` framing
-  have unit tests; the encoder is proven deterministic and thread-safe under concurrent load.
-- Validated at scale: a ~500 KB image with ~55 edits → an **829-byte** delta in ~0.2 s, reconstructed
-  byte-exact by detools.
+  have unit tests; both encoders are proven deterministic and thread-safe under concurrent load.
+- Validated at scale with real device params: a ~500 KB image with ~55 edits → an **829-byte** sequential
+  delta (~0.2 s), and an in-place delta in the actual nRF52 window (memory `0x98000`, 4096-byte segments),
+  both reconstructed byte-exact by detools.
 
-The in-place path is held to the same apply-equivalence bar in `tests/delta.rs`. When the in-place encoder is
-ported to Rust, detools drops to a pure test oracle (or frozen vectors), leaving the shipped binary
-Python-free for all delta types.
+The detools oracle lives entirely in `tests/` ([`tests/common/mod.rs`](tests/common/mod.rs)); tests skip
+cleanly on a checkout without `make dev-setup`.
 
 ## License
 

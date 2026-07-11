@@ -1,17 +1,18 @@
-//! Pure-Rust detools **sequential** patch encoder (no Python, no detools at runtime).
+//! Pure-Rust detools patch encoders — **sequential** (ESP32 A/B) and **in-place** (nRF52 single-slot).
+//! No Python, no detools at runtime.
 //!
-//! Produces a byte stream the on-device detools **C decoder** applies to the running image to reconstruct
-//! the target — the ESP32 A/B delta path (`codec_id = detools-sequential`). The nRF52 in-place path still
-//! goes through the detools shim (see [`crate::delta`]); porting it is future work.
+//! Produces byte streams the on-device detools **C decoder** applies to the running image to reconstruct
+//! the target (`codec_id = detools-sequential` / `detools-in-place`).
 //!
 //! ## Correctness contract
 //! A patch is correct iff the real detools decoder rebuilds the target **byte-for-byte** — NOT iff our
 //! bytes equal detools'. We therefore implement the *canonical* bsdiff algorithm (Colin Percival's, which
 //! detools' C mirrors): it is correct by construction — the control triples carry the exact `to - from`
 //! byte deltas and literal runs, so reconstruction is exact regardless of match quality. `tests/encode.rs`
-//! pins this by decoding every produced patch with the real detools decoder and comparing hashes.
+//! pins this by decoding every produced patch with the real detools decoder and hash-comparing to the
+//! target (and to detools' own patch's decode), across a deterministic sweep and both patch types.
 //!
-//! ## Wire format (matches `apply_patch_sequential` in detools 0.53.0)
+//! ## Sequential wire format (matches `apply_patch_sequential` in detools 0.53.0)
 //! ```text
 //! header(1) = (PATCH_TYPE_SEQUENTIAL<<4) | COMPRESSION_CRLE
 //! size(to_len)                                  ; signed varint, UNCOMPRESSED
@@ -20,10 +21,21 @@
 //!               size(extra_len) extra[extra_len]; literal to-bytes, from unchanged
 //!               size(seek) )                    ; signed; from cursor += seek
 //! ```
+//! The in-place format is documented on [`encode_in_place`].
 //!
 //! Pure and stateless — no shared mutable state, so it is inherently free of data races.
 
+/// detools patch layout — which decoder path reconstructs the image on-device.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PatchType {
+    /// Decodes into a fresh buffer (ESP32 A/B slot).
+    Sequential,
+    /// Reconstructs within one bounded window that starts holding the running image (nRF52 single-slot).
+    InPlace,
+}
+
 const PATCH_TYPE_SEQUENTIAL: u8 = 0;
+const PATCH_TYPE_IN_PLACE: u8 = 1;
 const COMPRESSION_CRLE: u8 = 2;
 const CRLE_SCATTERED: u8 = 0;
 const CRLE_REPEATED: u8 = 1;
@@ -42,6 +54,69 @@ pub fn encode_sequential(from: &[u8], to: &[u8]) -> Vec<u8> {
     }
     patch.extend(crle_compress(&body));
     patch
+}
+
+/// Encode a detools `in-place` + `crle` patch (nRF52 single-slot: the bootloader reconstructs the image
+/// within one bounded flash window that starts holding the running image). `memory_size`/`segment_size`
+/// MUST match the device bootloader's window, and `memory_size % segment_size == 0`.
+///
+/// Structure (matches `apply_patch_in_place` in detools 0.53.0):
+/// ```text
+/// header(1) = (PATCH_TYPE_IN_PLACE<<4) | COMPRESSION_CRLE
+/// size(memory_size) size(segment_size) size(shift_size) size(from_size) size(to_size)
+/// crle( per target segment: size(0) <bsdiff(shifted-base slice, segment)> )
+/// ```
+/// The base is conceptually shifted up by `shift_size` so writing each reconstructed segment low never
+/// clobbers base bytes a later segment still needs; segment `i` diffs against `base[max((i+1)*seg - shift, 0)..]`.
+pub fn encode_in_place(from: &[u8], to: &[u8], memory_size: u32, segment_size: u32) -> Vec<u8> {
+    let mem = memory_size as usize;
+    let seg = segment_size as usize;
+    assert!(
+        seg > 0 && mem % seg == 0,
+        "memory_size ({mem}) must be a non-zero multiple of segment_size ({seg})"
+    );
+
+    let minimum_shift = 2 * seg;
+    let shift_size = calc_shift(mem, seg, minimum_shift, from.len());
+    let shifted_size = mem - shift_size;
+    let from_data = &from[..from.len().min(shifted_size)]; // base survives the shift only up to here
+    let n_seg = to.len().div_ceil(seg);
+
+    let mut segments = Vec::new();
+    for s in 0..n_seg {
+        let to_offset = s * seg;
+        let from_offset = (to_offset + seg).saturating_sub(shift_size); // max(.., 0)
+        let seg_from: &[u8] = from_data.get(from_offset..).unwrap_or(&[]);
+        let seg_to = &to[to_offset..(to_offset + seg).min(to.len())];
+        segments.extend(pack_size(0)); // data-format = none, per segment
+        bsdiff(seg_from, seg_to, &mut segments);
+    }
+
+    let mut patch = vec![(PATCH_TYPE_IN_PLACE << 4) | COMPRESSION_CRLE];
+    patch.extend(pack_size(mem as i64));
+    patch.extend(pack_size(seg as i64));
+    patch.extend(pack_size(shift_size as i64));
+    patch.extend(pack_size(from.len() as i64)); // from_size = ORIGINAL length (pre-shift-truncation)
+    patch.extend(pack_size(to.len() as i64));
+    if to.is_empty() {
+        return patch;
+    }
+    patch.extend(crle_compress(&segments));
+    patch
+}
+
+/// Shift the base up by as many whole segments as the spare memory allows (>= `minimum_shift`), so a
+/// low-written target never overwrites base bytes a later segment still reads. Mirrors detools `calc_shift`.
+fn calc_shift(
+    memory_size: usize,
+    segment_size: usize,
+    minimum_shift: usize,
+    from_size: usize,
+) -> usize {
+    let memory_segments = memory_size.div_ceil(segment_size);
+    let from_segments = from_size.div_ceil(segment_size);
+    let shift_segments = memory_segments.saturating_sub(from_segments);
+    (shift_segments * segment_size).max(minimum_shift)
 }
 
 // ---- bsdiff (canonical) --------------------------------------------------------------------------

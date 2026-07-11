@@ -1,14 +1,16 @@
-//! Correctness sweep for the pure-Rust sequential encoder (`src/encode.rs`).
+//! Correctness sweep for the pure-Rust encoders (`src/encode.rs`), both patch types.
 //!
 //! For firmware OTA a single wrong bit corrupts the device, so every generated patch is decoded with the
-//! **real detools decoder** and its output is hash-compared to the exact bytes we asked to reconstruct.
-//! Inputs are DETERMINISTIC (seeded PRNG + fixed edit scripts across many lengths), so a failure is
-//! reproducible. We also cross-check against detools' OWN patch: our decode and detools' decode must hash
-//! equal (apply-equivalence, the on-device contract). Gated on the dev detools backend; skips cleanly
-//! without it (the pure-Rust `build --base` path itself needs no detools).
+//! **real detools decoder** ([`common`]) and its output is hash-compared to the exact bytes we asked to
+//! reconstruct. Inputs are DETERMINISTIC (seeded PRNG + fixed edit scripts across many lengths), so a
+//! failure is reproducible. We also cross-check against detools' OWN patch: our decode and detools' decode
+//! must hash equal (apply-equivalence, the on-device contract). Gated on the dev detools oracle; skips
+//! cleanly without it (the pure-Rust `build --base` path itself needs no detools).
+
+mod common;
 
 use motatool::crypto::sha256;
-use motatool::{delta, encode, PatchType};
+use motatool::{encode, PatchType};
 
 /// Deterministic byte stream (SplitMix64) — reproducible across runs and machines.
 fn prng(seed: u64, n: usize) -> Vec<u8> {
@@ -29,7 +31,6 @@ fn prng(seed: u64, n: usize) -> Vec<u8> {
 fn cases() -> Vec<(String, Vec<u8>, Vec<u8>)> {
     let mut v: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
 
-    // tiny lengths, base == target and base != target
     for n in [0usize, 1, 2, 3, 7, 15, 64] {
         let b = prng(1000 + n as u64, n);
         v.push((format!("identical/{n}"), b.clone(), b.clone()));
@@ -43,29 +44,24 @@ fn cases() -> Vec<(String, Vec<u8>, Vec<u8>)> {
     for &n in &[256usize, 1000, 4096, 20000] {
         let base = prng(42 + n as u64, n);
 
-        // version-bump: a handful of scattered edits
         let mut t = base.clone();
         for k in [0usize, 3, 4, n / 3, n / 2, n - 1] {
             t[k] ^= 0x5A;
         }
         v.push((format!("scattered/{n}"), base.clone(), t));
 
-        // append a tail
         let mut t = base.clone();
         t.extend(prng(7, n / 10));
         v.push((format!("append/{n}"), base.clone(), t));
 
-        // prepend (insertion at front — worst case for naive diffs)
         let mut t = prng(9, n / 10);
         t.extend_from_slice(&base);
         v.push((format!("prepend/{n}"), base.clone(), t));
 
-        // delete a middle chunk
         let mut t = base[..n / 4].to_vec();
         t.extend_from_slice(&base[n / 2..]);
         v.push((format!("delete-mid/{n}"), base.clone(), t));
 
-        // truncate and grow
         v.push((
             format!("truncate/{n}"),
             base.clone(),
@@ -75,14 +71,12 @@ fn cases() -> Vec<(String, Vec<u8>, Vec<u8>)> {
         t.extend(prng(11, n / 2));
         v.push((format!("grow/{n}"), base.clone(), t));
 
-        // wholly different content of the same length
         v.push((
             format!("different/{n}"),
             base.clone(),
             prng(999 + n as u64, n),
         ));
 
-        // empty edges
         v.push((format!("base-empty/{n}"), Vec::new(), base.clone()));
         v.push((format!("target-empty/{n}"), base.clone(), Vec::new()));
     }
@@ -100,32 +94,34 @@ fn cases() -> Vec<(String, Vec<u8>, Vec<u8>)> {
     v
 }
 
-fn assert_case(name: &str, base: &[u8], target: &[u8]) {
-    let patch = encode::encode_sequential(base, target);
+/// The core assertion for one case + patch type: our patch and detools' patch, decoded by the real detools
+/// decoder, both reconstruct `target` byte-for-byte (via hashes). `mem`/`seg` are unused for sequential.
+fn assert_case(name: &str, base: &[u8], target: &[u8], ptype: PatchType, mem: u32, seg: u32) {
+    let patch = match ptype {
+        PatchType::Sequential => encode::encode_sequential(base, target),
+        PatchType::InPlace => encode::encode_in_place(base, target, mem, seg),
+    };
 
-    // Deterministic: identical inputs must yield identical bytes (no nondeterminism/races in the encoder).
-    assert_eq!(
-        patch,
-        encode::encode_sequential(base, target),
-        "[{name}] encoder is not deterministic"
-    );
+    // Deterministic: identical inputs must yield identical bytes (no nondeterminism/races).
+    let patch2 = match ptype {
+        PatchType::Sequential => encode::encode_sequential(base, target),
+        PatchType::InPlace => encode::encode_in_place(base, target, mem, seg),
+    };
+    assert_eq!(patch, patch2, "[{name}] encoder is not deterministic");
 
-    // THE guarantee: the real detools decoder rebuilds `target` from `base` + our patch, byte-for-byte.
-    let decoded = delta::apply_patch(base, &patch, PatchType::Sequential, 0, target.len() as u32)
-        .unwrap_or_else(|e| panic!("[{name}] detools apply failed: {e}"));
+    // THE guarantee: real detools rebuilds `target` from `base` + our patch, byte-for-byte.
+    let decoded = common::apply(base, &patch, ptype, mem, target.len() as u32);
     assert_eq!(
         sha256(&decoded),
         sha256(target),
-        "[{name}] decoded image hash != target (len {} vs {})",
+        "[{name}] decoded hash != target (len {} vs {})",
         decoded.len(),
         target.len()
     );
 
     // Apply-equivalence vs detools' OWN patch: both decode to the same bytes.
-    let dt = delta::encode_patch(base, target, PatchType::Sequential, None)
-        .unwrap_or_else(|e| panic!("[{name}] detools encode failed: {e}"));
-    let decoded_dt =
-        delta::apply_patch(base, &dt, PatchType::Sequential, 0, target.len() as u32).unwrap();
+    let dt = common::encode(base, target, ptype, mem, seg);
+    let decoded_dt = common::apply(base, &dt, ptype, mem, target.len() as u32);
     assert_eq!(
         sha256(&decoded),
         sha256(&decoded_dt),
@@ -133,26 +129,69 @@ fn assert_case(name: &str, base: &[u8], target: &[u8]) {
     );
 }
 
+/// A memory window that always yields a valid in-place patch for a case (base + target fit without overlap,
+/// so no segment ever clobbers base bytes a later one needs). Multiple of `seg`. Tight-memory (real device)
+/// is exercised separately by `in_place_realistic_device_window`.
+fn generous_mem(from: usize, to: usize, seg: usize) -> u32 {
+    (((from + to).div_ceil(seg)) + 2) as u32 * seg as u32
+}
+
 #[test]
 fn sequential_encoder_reconstructs_every_case() {
-    if !delta::available() {
+    if !common::available() {
         eprintln!("SKIP: detools backend unavailable (run `make dev-setup`)");
         return;
     }
     for (name, base, target) in cases() {
-        assert_case(&name, &base, &target);
+        assert_case(&name, &base, &target, PatchType::Sequential, 0, 0);
     }
 }
 
 #[test]
-fn crle_output_is_a_valid_detools_stream() {
-    if !delta::available() {
+fn in_place_encoder_reconstructs_every_case() {
+    if !common::available() {
         eprintln!("SKIP: detools backend unavailable");
         return;
     }
-    // random (scattered), constant runs (repeated), mixed, and empty — decompressed by REAL detools.
+    let seg = 256usize;
+    for (name, base, target) in cases() {
+        let mem = generous_mem(base.len(), target.len(), seg);
+        assert_case(&name, &base, &target, PatchType::InPlace, mem, seg as u32);
+    }
+}
+
+#[test]
+fn in_place_realistic_device_window() {
+    // Real nRF52 params: memory 0x98000, one flash page per segment, a ~500 KB image with a small delta —
+    // tight memory where the shift/overlap logic actually matters, reconstructed byte-exact by detools.
+    if !common::available() {
+        eprintln!("SKIP: detools backend unavailable");
+        return;
+    }
+    let base = prng(2024, 500_000);
+    let mut target = base.clone();
+    for k in (0..base.len()).step_by(9000) {
+        target[k] ^= 0x5A; // ~55 scattered edits (version-bump scale)
+    }
+    target.extend(prng(3, 400));
+    assert_case(
+        "realistic-inplace",
+        &base,
+        &target,
+        PatchType::InPlace,
+        0x98000,
+        4096,
+    );
+}
+
+#[test]
+fn crle_output_is_a_valid_detools_stream() {
+    if !common::available() {
+        eprintln!("SKIP: detools backend unavailable");
+        return;
+    }
     let mut inputs: Vec<Vec<u8>> = vec![Vec::new(), vec![0u8; 6], vec![0xAA; 1000]];
-    inputs.push(prng(1, 500)); // essentially all-scattered
+    inputs.push(prng(1, 500));
     let mut mixed = prng(2, 400);
     mixed.extend(vec![0x11; 40]);
     mixed.extend(prng(3, 400));
@@ -164,29 +203,37 @@ fn crle_output_is_a_valid_detools_stream() {
 
     for data in inputs {
         let comp = encode::crle_compress(&data);
-        let back = delta::crle_decompress(&comp, data.len()).unwrap();
+        let back = common::crle_decompress(&comp, data.len());
         assert_eq!(back, data, "crle round-trip mismatch (len {})", data.len());
     }
 }
 
 #[test]
-fn encoder_is_thread_safe_and_deterministic_under_load() {
-    // The encoder holds no shared state; prove it: many threads encoding concurrently must each match the
-    // single-threaded result exactly. (No detools needed — this is a pure-Rust property.)
+fn encoders_are_thread_safe_and_deterministic_under_load() {
+    // The encoders hold no shared state; prove it: many threads encoding concurrently must each match the
+    // single-threaded result exactly. (No detools needed — a pure-Rust property.)
     let base = prng(100, 8000);
     let mut target = base.clone();
     for k in [10usize, 2000, 4000, 7999] {
         target[k] ^= 0x33;
     }
-    let expected = sha256(&encode::encode_sequential(&base, &target));
+    let seq = sha256(&encode::encode_sequential(&base, &target));
+    let ip = sha256(&encode::encode_in_place(&base, &target, 0x8000, 4096));
 
     let handles: Vec<_> = (0..8)
         .map(|_| {
             let (b, t) = (base.clone(), target.clone());
-            std::thread::spawn(move || sha256(&encode::encode_sequential(&b, &t)))
+            std::thread::spawn(move || {
+                (
+                    sha256(&encode::encode_sequential(&b, &t)),
+                    sha256(&encode::encode_in_place(&b, &t, 0x8000, 4096)),
+                )
+            })
         })
         .collect();
     for h in handles {
-        assert_eq!(h.join().unwrap(), expected, "concurrent encode diverged");
+        let (s, i) = h.join().unwrap();
+        assert_eq!(s, seq, "concurrent sequential encode diverged");
+        assert_eq!(i, ip, "concurrent in-place encode diverged");
     }
 }
