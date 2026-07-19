@@ -52,11 +52,23 @@ pub const ENDF_OFF_FWVER: usize = 16;
 pub const ENDF_OFF_TARGET: usize = 20;
 pub const ENDF_OFF_HWID: usize = 24;
 
-// ---- nRF52 in-place apply limits (mirror OtaFlashLayout_nrf52.h); used to warn on oversized deltas ----
-pub const NRF52_INPLACE_MEMORY: u32 = 0x0009_8000;
+// ---- nRF52 in-place layout (mirror OtaFlashLayout_nrf52.h) ----
+pub const NRF52_APP_BASE: u32 = 0x0002_6000;
+pub const NRF52_EXTRAFS_START: u32 = 0x000D_4000;
+pub const NRF52_INTERNALFS_START: u32 = 0x000ED_000;
+pub const NRF52_FLASH_PAGE: u32 = 4096;
+pub const NRF52_STAGE_CEILING_COMPANION: u32 = NRF52_EXTRAFS_START;
+pub const NRF52_STAGE_CEILING_REPEATER: u32 = NRF52_INTERNALFS_START;
 pub const NRF52_INPLACE_SEGMENT: u32 = 4096;
-pub const NRF52_FLASH_SPAN: u32 = 0x000D_4000 - 0x0002_6000; // 0xAE000
-pub const NRF52_MAX_INPLACE_MOTA: u32 = NRF52_FLASH_SPAN - NRF52_INPLACE_MEMORY; // ~90 KB
+
+pub fn nrf52_align_down(x: u32, unit: u32) -> u32 {
+    x & !(unit - 1)
+}
+
+/// Bottom-aligned `.mota` start for `total` bytes staged below `ceiling`.
+pub fn nrf52_mota_stage_start(total: u32, ceiling: u32) -> u32 {
+    nrf52_align_down(ceiling - total, NRF52_FLASH_PAGE)
+}
 
 /// The mota-seeder link protocol (host ⇄ node), mirroring `src/helpers/ota/MotaSeederProto.h`.
 ///

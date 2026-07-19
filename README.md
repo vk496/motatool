@@ -115,7 +115,8 @@ motatool build --base running_firmware.bin --fw new_firmware.bin --patch-type in
 `--base` must be the device's **real running image, with its `EndF` trailer** — the delta is applied to
 exactly that image on-device, and its 8-byte `base_hash` is checked against the running firmware before apply.
 The delta payload is a **detools** patch (`--compression crle`, matching the firmware's compile-time decoder
-config); `--patch-type in-place` also takes `--inplace-memory` (nRF52 default `0x98000`) and `--segment-size`.
+config); `--patch-type in-place` auto-derives `--inplace-memory` from the target's staging ceiling and patch
+size (companion `0xD4000`, repeater `0xED000`; override with `--inplace-memory`) and accepts `--segment-size`.
 
 **Both patch types are pure Rust** — [`src/encode.rs`](src/encode.rs) implements the detools
 `sequential` + `crle` (ESP32 A/B) and `in-place` + `crle` (nRF52 single-slot) formats (canonical bsdiff +

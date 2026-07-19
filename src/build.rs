@@ -10,13 +10,14 @@ use crate::encode::PatchType;
 use crate::endf::{ensure_endf, has_endf, parse_ident, version_str};
 use crate::format::*;
 use crate::merkle;
+use crate::targets;
 use anyhow::{bail, Result};
 
 pub struct BuildOpts {
     pub fw: Vec<u8>,
     pub base: Option<Vec<u8>>,
     pub patch_type: PatchType,   // delta layout; used iff base.is_some()
-    pub inplace_memory: u32,     // in-place apply window; used iff patch_type == InPlace
+    pub inplace_memory: Option<u32>, // in-place apply window; None = auto from target ceiling + patch
     pub segment_size: u32,       // in-place segment; used iff patch_type == InPlace
     pub target_id: Option<u32>,  // overrides the EndF identity
     pub fw_version: Option<u32>, // overrides the EndF identity
@@ -139,25 +140,89 @@ fn build_delta(
             crate::encode::encode_sequential(&base_image, image),
         ),
         PatchType::InPlace => {
-            if o.segment_size == 0 || o.inplace_memory % o.segment_size != 0 {
-                bail!(
-                    "in-place: --inplace-memory ({}) must be a non-zero multiple of --segment-size ({})",
-                    o.inplace_memory,
-                    o.segment_size
-                );
+            if o.segment_size == 0 {
+                bail!("in-place: --segment-size must be non-zero");
             }
+            let stage_ceiling = targets::nrf52_stage_ceiling_for_target(ident.target_id);
+            let memory_size = match o.inplace_memory {
+                Some(m) => {
+                    if m == 0 || m % o.segment_size != 0 {
+                        bail!(
+                            "in-place: --inplace-memory ({m}) must be a non-zero multiple of --segment-size ({})",
+                            o.segment_size
+                        );
+                    }
+                    m
+                }
+                None => compute_inplace_memory(
+                    &base_image,
+                    image,
+                    stage_ceiling,
+                    o.segment_size,
+                    o.block_size,
+                )?,
+            };
             (
                 Codec::DetoolsInplace,
                 crate::encode::encode_in_place(
                     &base_image,
                     image,
-                    o.inplace_memory,
+                    memory_size,
                     o.segment_size,
                 ),
             )
         }
     };
     Ok((codec, patch, base_hash))
+}
+
+/// Derive the in-place apply window from the target's staging ceiling and the patch size. Iterates
+/// because mota_total ↔ patch bytes ↔ mota_addr ↔ memory_size are circular.
+fn compute_inplace_memory(
+    from: &[u8],
+    to: &[u8],
+    stage_ceiling: u32,
+    segment_size: u32,
+    block_size: u32,
+) -> Result<u32> {
+    let to_len = to.len() as u32;
+    let max_memory = stage_ceiling - NRF52_APP_BASE;
+    if to_len > max_memory {
+        bail!(
+            "target image {to_len} B exceeds max apply window {max_memory} B for ceiling 0x{stage_ceiling:X}"
+        );
+    }
+
+    let est_patch = (from.len().max(to.len()) / 4 + 4096) as u32;
+    let est_leaves = 64u32;
+    let est_mota = (HEADER_LEN + MFL + est_leaves as usize * 4 + est_patch as usize + TRAILER_LEN) as u32;
+    let mut memory = nrf52_align_down(
+        nrf52_mota_stage_start(est_mota, stage_ceiling) - NRF52_APP_BASE,
+        segment_size,
+    );
+    if memory == 0 {
+        memory = segment_size;
+    }
+
+    for _ in 0..8 {
+        if to_len > memory {
+            bail!(
+                "target image {to_len} B exceeds apply window {memory} B (ceiling 0x{stage_ceiling:X})"
+            );
+        }
+        let patch = crate::encode::encode_in_place(from, to, memory, segment_size);
+        let leaves = merkle::leaf_hashes(&patch, block_size as usize);
+        let total = (HEADER_LEN + MFL + leaves.len() * 4 + patch.len() + TRAILER_LEN) as u32;
+        let new_memory = nrf52_align_down(
+            nrf52_mota_stage_start(total, stage_ceiling) - NRF52_APP_BASE,
+            segment_size,
+        );
+        if new_memory == memory {
+            return Ok(memory);
+        }
+        memory = new_memory.max(segment_size);
+    }
+    bail!("in-place memory_size did not converge for ceiling 0x{stage_ceiling:X}")
 }
 
 /// log2 of a power-of-two block size (1024 → 10).
