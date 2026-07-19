@@ -17,6 +17,23 @@ pub fn label(target_id: u32) -> &'static str {
     env_name(target_id).unwrap_or("N/A")
 }
 
+/// nRF52 staging ceiling for a PlatformIO env name. Companion builds stage below ExtraFS; other roles
+/// (repeater, room server, …) reclaim up to InternalFS start.
+pub fn nrf52_stage_ceiling(env_name: &str) -> u32 {
+    if env_name.to_ascii_lowercase().contains("companion") {
+        crate::format::NRF52_STAGE_CEILING_COMPANION
+    } else {
+        crate::format::NRF52_STAGE_CEILING_REPEATER
+    }
+}
+
+/// Staging ceiling for a known OTA target_id, or the companion-safe default when unknown.
+pub fn nrf52_stage_ceiling_for_target(target_id: u32) -> u32 {
+    env_name(target_id)
+        .map(nrf52_stage_ceiling)
+        .unwrap_or(crate::format::NRF52_STAGE_CEILING_COMPANION)
+}
+
 #[rustfmt::skip]
 static TABLE: &[(u32, &str)] = &[
     (0x149bcb23, "Ebyte_EoRa-S3_companion_radio_ble"),
@@ -438,3 +455,16 @@ static TABLE: &[(u32, &str)] = &[
     (0xf967a300, "Xiao_S3_WIO_sensor"),
     (0xa0cc1c36, "Xiao_S3_WIO_terminal_chat"),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nrf52_stage_ceiling_by_role() {
+        assert_eq!(nrf52_stage_ceiling("RAK_4631_companion_radio_ble"), 0x000D_4000);
+        assert_eq!(nrf52_stage_ceiling("RAK_4631_repeater"), 0x000ED_000);
+        assert_eq!(nrf52_stage_ceiling_for_target(0x04d413fd), 0x000ED_000);
+        assert_eq!(nrf52_stage_ceiling_for_target(0x9f4d58ac), 0x000D_4000);
+    }
+}
